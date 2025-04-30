@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WebXR AR Runner Game</title>
+  <title>WebXR Three-Lane Runner Game</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -45,17 +45,19 @@
       backdrop-filter: blur(5px);
       box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
-    #scoreDisplay {
+    #score-display {
       position: absolute;
-      top: 20px;
-      right: 20px;
+      top: 80px;
+      left: 20px;
+      z-index: 1;
       font-size: 24px;
+      font-weight: bold;
       color: white;
-      background: rgba(0, 0, 0, 0.6);
+      background: rgba(0, 0, 0, 0.5);
       padding: 10px 15px;
       border-radius: 12px;
       display: none;
-      z-index: 2;
+      backdrop-filter: blur(5px);
     }
   </style>
 </head>
@@ -64,25 +66,25 @@
     <button id="start-button">Start AR Runner Game</button>
     <div id="status"></div>
   </div>
-  <div id="scoreDisplay">Score: 0</div>
+  <div id="score-display">Score: 0</div>
   
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
-    import { ARButton } from 'https://unpkg.com/three@0.150.1/examples/jsm/webxr/ARButton.js';
 
     let camera, scene, renderer;
-    let rightController;
-    let gameRunway;
+    let controller;
     let player;
+    let ground;
     let obstacles = [];
-    let collectibles = [];
-    let score = 0;
-    let isGameActive = false;
-    let lanes = [-0.4, 0, 0.4]; // Left, Center, Right
-    let currentLane = 1; // Start in the center lane
     let clock = new THREE.Clock();
-    let gameSpeed = 2; // Base game speed
-    let gameArea;
+    let isPlaying = false;
+    let playerLane = 1; // 0: left, 1: center, 2: right
+    let lanePositions = [-0.4, 0, 0.4]; // X positions of lanes
+    let lastControllerRotation = new THREE.Euler();
+    let score = 0;
+    let gameSpeed = 2.0; // Initial speed
+    let spawnInterval = 2.0; // Time between obstacle spawns
+    let lastSpawnTime = 0;
     
     init();
 
@@ -104,32 +106,34 @@
       scene.add(ambientLight);
 
       const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
-      directionalLight.position.set(0, 1, 0);
+      directionalLight.position.set(1, 1, 1);
       directionalLight.castShadow = true;
       scene.add(directionalLight);
 
       // Start button event
-      document.getElementById('start-button').addEventListener('click', () => {
-        if (navigator.xr) {
-          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
-            if (supported) {
-              const sessionInit = { 
-                requiredFeatures: ['hit-test'],
-                optionalFeatures: ['dom-overlay'], 
-                domOverlay: { root: document.body } 
-              };
-              navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
-            } else {
-              updateStatus('WebXR AR session is not supported on this device.');
-            }
-          });
-        } else {
-          updateStatus('WebXR is not supported in this browser.');
-        }
-      });
+      document.getElementById('start-button').addEventListener('click', startARSession);
 
       // Handle window resize
       window.addEventListener('resize', onWindowResize);
+    }
+
+    function startARSession() {
+      if (navigator.xr) {
+        navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+          if (supported) {
+            const sessionInit = { 
+              requiredFeatures: ['hit-test'],
+              optionalFeatures: ['dom-overlay'], 
+              domOverlay: { root: document.body } 
+            };
+            navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
+          } else {
+            updateStatus('WebXR AR session is not supported on this device.');
+          }
+        });
+      } else {
+        updateStatus('WebXR is not supported in this browser.');
+      }
     }
 
     function updateStatus(message) {
@@ -138,10 +142,11 @@
       statusElement.textContent = message;
     }
 
-    function updateScore(points) {
-      score += points;
-      const scoreDisplay = document.getElementById('scoreDisplay');
-      scoreDisplay.textContent = `Score: ${score}`;
+    function updateScore(newScore) {
+      score = newScore;
+      const scoreElement = document.getElementById('score-display');
+      scoreElement.style.display = 'block';
+      scoreElement.textContent = `Score: ${score}`;
     }
 
     function onWindowResize() {
@@ -157,123 +162,91 @@
       
       // Hide button and show status
       document.getElementById('start-button').style.display = 'none';
-      document.getElementById('scoreDisplay').style.display = 'block';
-      updateStatus('Looking for surface to place the game...');
+      updateStatus('Building game environment...');
+      updateScore(0);
 
-      // Set up right controller
-      setupController(session);
-
-      // Create the game area container
-      gameArea = new THREE.Group();
-      scene.add(gameArea);
-      
-      // Position the game area in front of the user
-      gameArea.position.set(0, -0.5, -2);
-      
       // Create game elements
-      createRunway();
+      createGameEnvironment();
       createPlayer();
       
+      // Set up controller
+      setupController(session);
+
       // Start animation loop
       renderer.setAnimationLoop(render);
 
       // Handle session end
       session.addEventListener('end', onSessionEnd);
       
-      // Start the game after a brief delay
-      setTimeout(() => {
-        startGame();
-      }, 2000);
+      // Start game
+      isPlaying = true;
+      updateStatus('Rotate controller to change lanes!');
     }
 
     function onSessionEnd() {
-      isGameActive = false;
-      updateStatus('AR session ended');
+      isPlaying = false;
+      updateStatus('Game ended');
       document.getElementById('start-button').style.display = 'block';
-      document.getElementById('scoreDisplay').style.display = 'none';
+      document.getElementById('score-display').style.display = 'none';
+      
+      // Clean up game objects
+      if (player) scene.remove(player);
+      if (ground) scene.remove(ground);
+      obstacles.forEach(obstacle => scene.remove(obstacle));
+      obstacles = [];
     }
 
-    function createRunway() {
-      // Create a runway for the game
-      const runwayGeometry = new THREE.BoxGeometry(1.5, 0.02, 6);
-      const runwayMaterial = new THREE.MeshStandardMaterial({
-        color: 0x444444,
-        metalness: 0.3,
-        roughness: 0.7,
+    function createGameEnvironment() {
+      // Create a runway
+      const groundGeometry = new THREE.BoxGeometry(1.5, 0.02, 10);
+      const groundMaterial = new THREE.MeshStandardMaterial({
+        color: 0x333333,
+        roughness: 0.8,
+        metalness: 0.2
       });
-      gameRunway = new THREE.Mesh(runwayGeometry, runwayMaterial);
-      gameRunway.receiveShadow = true;
-      gameArea.add(gameRunway);
+      ground = new THREE.Mesh(groundGeometry, groundMaterial);
+      ground.position.set(0, -0.1, -5); // Position in front of the camera
+      ground.receiveShadow = true;
+      scene.add(ground);
       
       // Add lane markers
-      const laneWidth = 0.3;
-      const laneMaterial = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
-      
-      // Left lane marker
-      const leftLaneGeometry = new THREE.BoxGeometry(0.05, 0.025, 6);
-      const leftLane = new THREE.Mesh(leftLaneGeometry, laneMaterial);
-      leftLane.position.x = lanes[0] - laneWidth/2;
-      leftLane.position.y = 0.01;
-      gameArea.add(leftLane);
-      
-      // Right lane marker
-      const rightLaneGeometry = new THREE.BoxGeometry(0.05, 0.025, 6);
-      const rightLane = new THREE.Mesh(rightLaneGeometry, laneMaterial);
-      rightLane.position.x = lanes[2] + laneWidth/2;
-      rightLane.position.y = 0.01;
-      gameArea.add(rightLane);
-      
-      // Center lane marker (dashed)
-      for (let i = -2.9; i < 3; i += 0.4) {
-        const centerLanePiece = new THREE.Mesh(
-          new THREE.BoxGeometry(0.05, 0.025, 0.2),
-          laneMaterial
+      for (let i = 0; i < 3; i++) {
+        const laneMarker = new THREE.Mesh(
+          new THREE.BoxGeometry(0.05, 0.03, 10),
+          new THREE.MeshStandardMaterial({ color: 0xFFFFFF })
         );
-        centerLanePiece.position.set(lanes[0] + laneWidth/2, 0.01, i);
-        gameArea.add(centerLanePiece);
-        
-        const centerLanePiece2 = new THREE.Mesh(
-          new THREE.BoxGeometry(0.05, 0.025, 0.2),
-          laneMaterial
-        );
-        centerLanePiece2.position.set(lanes[2] - laneWidth/2, 0.01, i);
-        gameArea.add(centerLanePiece2);
+        laneMarker.position.set((i - 1) * 0.4, -0.08, -5);
+        scene.add(laneMarker);
       }
     }
 
     function createPlayer() {
       // Create player character
-      const playerGeometry = new THREE.CapsuleGeometry(0.1, 0.2, 4, 8);
-      const playerMaterial = new THREE.MeshStandardMaterial({
+      const geometry = new THREE.SphereGeometry(0.1, 16, 16);
+      const material = new THREE.MeshStandardMaterial({
         color: 0x4876FF,
-        metalness: 0.7,
-        roughness: 0.3,
+        metalness: 0.3,
+        roughness: 0.4,
+        emissive: 0x0033FF,
+        emissiveIntensity: 0.3
       });
-      player = new THREE.Mesh(playerGeometry, playerMaterial);
-      player.position.set(lanes[currentLane], 0.15, -2); // Position at the bottom of runway
+      player = new THREE.Mesh(geometry, material);
+      player.position.set(lanePositions[playerLane], 0, -1); // Start in center lane
       player.castShadow = true;
-      player.receiveShadow = true;
-      gameArea.add(player);
+      scene.add(player);
     }
 
     function setupController(session) {
-      // Create right controller (Meta Quest 3 uses handedness to identify controllers)
-      rightController = renderer.xr.getController(1); // Index 1 typically for right controller
-      rightController.addEventListener('connected', (event) => {
+      // Create controller
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('connected', (event) => {
         const xrInputSource = event.data;
-        if (xrInputSource.handedness === 'right') {
-          updateStatus('Right controller connected. Move left/right to change lanes.');
-          
-          // Initialize gamepad for vibration
-          if (xrInputSource.gamepad && xrInputSource.gamepad.hapticActuators && xrInputSource.gamepad.hapticActuators.length > 0) {
-            rightController.userData.hapticActuator = xrInputSource.gamepad.hapticActuators[0];
-          }
-        } else {
-          updateStatus('Please use the right controller for lane changes.');
-        }
+        updateStatus(`Controller connected: ${xrInputSource.handedness}. Rotate to change lanes!`);
       });
       
-      // Add controller visuals
+      scene.add(controller);
+      
+      // Add a visual for the controller
       const controllerGeometry = new THREE.CylinderGeometry(0.01, 0.02, 0.1, 16);
       const controllerMaterial = new THREE.MeshStandardMaterial({
         color: 0xFF4500,
@@ -282,235 +255,155 @@
       });
       const controllerMesh = new THREE.Mesh(controllerGeometry, controllerMaterial);
       controllerMesh.rotation.x = Math.PI / 2;
-      rightController.add(controllerMesh);
-      
-      scene.add(rightController);
-      
-      // Store previous controller position for movement detection
-      rightController.userData = { 
-        previousPosition: new THREE.Vector3(),
-        movementCooldown: 0,
-        hapticActuator: null
-      };
-    }
-
-    function startGame() {
-      isGameActive = true;
-      score = 0;
-      updateScore(0);
-      updateStatus('Game started! Move right controller side to side to change lanes.');
-      
-      // Reset game elements
-      obstacles.forEach(obstacle => gameArea.remove(obstacle));
-      collectibles.forEach(collectible => gameArea.remove(collectible));
-      
-      obstacles = [];
-      collectibles = [];
-      
-      clock.start();
+      controller.add(controllerMesh);
     }
 
     function spawnObstacle() {
-      if (!isGameActive) return;
+      // Randomly select a lane
+      const lane = Math.floor(Math.random() * 3);
       
-      // Choose a random lane
-      const randomLane = Math.floor(Math.random() * 3);
-      
-      // Create obstacle
-      const obstacleGeometry = new THREE.BoxGeometry(0.25, 0.25, 0.25);
-      const obstacleMaterial = new THREE.MeshStandardMaterial({
+      // Create an obstacle
+      const geometry = new THREE.BoxGeometry(0.3, 0.2, 0.2);
+      const material = new THREE.MeshStandardMaterial({
         color: 0xFF0000,
         roughness: 0.4,
         metalness: 0.6
       });
-      
-      const obstacle = new THREE.Mesh(obstacleGeometry, obstacleMaterial);
-      obstacle.position.set(lanes[randomLane], 0.15, 3); // Start at the far end of runway
+      const obstacle = new THREE.Mesh(geometry, material);
+      obstacle.position.set(lanePositions[lane], 0, -10); // Far end of runway
       obstacle.castShadow = true;
-      obstacle.receiveShadow = true;
+      obstacle.userData = { isObstacle: true, lane: lane };
       
-      // Add to scene and track
-      gameArea.add(obstacle);
+      scene.add(obstacle);
       obstacles.push(obstacle);
-      
-      // Schedule next obstacle
-      const timeToNext = 1.5 + Math.random() * 1.5; // 1.5 to 3 seconds apart
-      setTimeout(spawnObstacle, timeToNext * 1000);
     }
 
-    function spawnCollectible() {
-      if (!isGameActive) return;
-      
-      // Choose a random lane
-      const randomLane = Math.floor(Math.random() * 3);
-      
-      // Create coin
-      const coinGeometry = new THREE.CylinderGeometry(0.07, 0.07, 0.02, 16);
-      const coinMaterial = new THREE.MeshStandardMaterial({
-        color: 0xFFD700,
-        roughness: 0.2,
-        metalness: 0.9,
-        emissive: 0xFFD700,
-        emissiveIntensity: 0.3
-      });
-      
-      const coin = new THREE.Mesh(coinGeometry, coinMaterial);
-      coin.rotation.x = Math.PI / 2; // Lay flat
-      coin.position.set(lanes[randomLane], 0.15, 3); // Start at the far end
-      coin.castShadow = true;
-      
-      // Add to scene and track
-      gameArea.add(coin);
-      collectibles.push(coin);
-      
-      // Schedule next collectible
-      const timeToNext = 1 + Math.random() * 2; // 1 to 3 seconds apart
-      setTimeout(spawnCollectible, timeToNext * 1000);
-    }
-
-    function updateGameElements(deltaTime) {
-      const moveSpeed = gameSpeed * deltaTime;
-      
-      // Update obstacles
+    function checkCollisions() {
+      // Check for collisions with player
       for (let i = obstacles.length - 1; i >= 0; i--) {
         const obstacle = obstacles[i];
-        obstacle.position.z -= moveSpeed;
         
-        // Remove if it's past the player
-        if (obstacle.position.z < -3) {
-          gameArea.remove(obstacle);
-          obstacles.splice(i, 1);
-          continue;
-        }
+        // Simple collision detection (distance-based)
+        const distance = player.position.distanceTo(obstacle.position);
         
-        // Rotate for visual effect
-        obstacle.rotation.x += 0.03;
-        obstacle.rotation.y += 0.03;
-        
-        // Check collision with player
-        if (Math.abs(obstacle.position.x - player.position.x) < 0.2 && 
-            Math.abs(obstacle.position.z - player.position.z) < 0.3) {
-          // Collision with obstacle
-          gameArea.remove(obstacle);
-          obstacles.splice(i, 1);
+        if (distance < 0.2) {
+          // Collision detected
+          updateStatus('Collision! Game over.');
+          isPlaying = false;
           
-          // Visual feedback and lose points
-          player.material.emissive.setRGB(1, 0, 0);
-          player.material.emissiveIntensity = 1;
+          // Visual feedback
+          player.material.emissive.set(0xFF0000);
+          player.material.emissiveIntensity = 0.8;
+          
+          // Wait a moment and restart
           setTimeout(() => {
-            player.material.emissiveIntensity = 0;
-          }, 300);
+            resetGame();
+          }, 2000);
           
-          updateScore(-10);
-          updateStatus('Ouch! -10 points');
+          return true;
         }
       }
       
-      // Update collectibles
-      for (let i = collectibles.length - 1; i >= 0; i--) {
-        const collectible = collectibles[i];
-        collectible.position.z -= moveSpeed;
-        
-        // Remove if it's past the player
-        if (collectible.position.z < -3) {
-          gameArea.remove(collectible);
-          collectibles.splice(i, 1);
-          continue;
-        }
-        
-        // Rotate for visual effect
-        collectible.rotation.z += 0.05;
-        
-        // Check collision with player
-        if (Math.abs(collectible.position.x - player.position.x) < 0.2 && 
-            Math.abs(collectible.position.z - player.position.z) < 0.3) {
-          // Collect the coin
-          gameArea.remove(collectible);
-          collectibles.splice(i, 1);
-          
-          // Visual feedback and add points
-          player.material.emissive.setRGB(0, 1, 0);
-          player.material.emissiveIntensity = 1;
-          setTimeout(() => {
-            player.material.emissiveIntensity = 0;
-          }, 300);
-          
-          updateScore(5);
-          updateStatus('Coin collected! +5 points');
-        }
-      }
-      
-      // Speed up game slightly over time
-      gameSpeed += deltaTime * 0.01;
+      return false;
     }
 
-    function checkControllerMovement() {
-      if (!rightController || !rightController.userData) return;
+    function resetGame() {
+      // Reset game state
+      updateScore(0);
+      playerLane = 1;
+      gameSpeed = 2.0;
+      isPlaying = true;
       
-      const userData = rightController.userData;
+      // Reset player
+      player.position.set(lanePositions[playerLane], 0, -1);
+      player.material.emissive.set(0x0033FF);
+      player.material.emissiveIntensity = 0.3;
       
-      // Don't check movement during cooldown
-      if (userData.movementCooldown > 0) {
-        userData.movementCooldown -= clock.getDelta();
-        return;
-      }
+      // Remove all obstacles
+      obstacles.forEach(obstacle => scene.remove(obstacle));
+      obstacles = [];
       
-      // Get controller position
-      const currentPosition = new THREE.Vector3();
-      rightController.getWorldPosition(currentPosition);
+      updateStatus('Game restarted! Rotate controller to change lanes.');
+    }
+
+    function handleControllerRotation() {
+      if (!controller || !isPlaying) return;
       
-      // Calculate horizontal movement
-      const movement = currentPosition.x - userData.previousPosition.x;
+      // Get controller rotation
+      const controllerRotation = new THREE.Euler().setFromQuaternion(controller.quaternion);
       
-      // Check for significant movement (tuned for Meta Quest 3 sensitivity)
-      if (Math.abs(movement) > 0.15) {
-        let newLane = currentLane;
-        // Move left
-        if (movement < -0.15 && currentLane > 0) {
-          newLane = currentLane - 1;
-        }
-        // Move right
-        else if (movement > 0.15 && currentLane < 2) {
-          newLane = currentLane + 1;
+      // Check if roll (z-axis) has changed significantly
+      const rollChange = controllerRotation.z - lastControllerRotation.z;
+      
+      // Threshold for lane change (adjust as needed)
+      if (Math.abs(rollChange) > 0.1) {
+        if (rollChange > 0) {
+          // Clockwise rotation - move right
+          playerLane = Math.min(playerLane + 1, 2);
+        } else {
+          // Counter-clockwise rotation - move left
+          playerLane = Math.max(playerLane - 1, 0);
         }
         
-        // Update lane and provide feedback if lane changed
-        if (newLane !== currentLane) {
-          currentLane = newLane;
-          userData.movementCooldown = 0.5; // Half second cooldown
+        // Provide feedback
+        updateStatus(`Changed to ${['left', 'center', 'right'][playerLane]} lane`);
+      }
+      
+      // Update player position toward target lane
+      const targetX = lanePositions[playerLane];
+      player.position.x += (targetX - player.position.x) * 0.2;
+      
+      // Store current rotation for next frame
+      lastControllerRotation.copy(controllerRotation);
+    }
+
+    function updateObstacles(deltaTime) {
+      // Move obstacles forward
+      for (let i = obstacles.length - 1; i >= 0; i--) {
+        const obstacle = obstacles[i];
+        obstacle.position.z += gameSpeed * deltaTime;
+        
+        // Remove obstacles that have passed the player
+        if (obstacle.position.z > 0) {
+          scene.remove(obstacle);
+          obstacles.splice(i, 1);
           
-          // Trigger haptic feedback
-          if (userData.hapticActuator) {
-            userData.hapticActuator.pulse(0.7, 100); // Intensity 0.7, 100ms duration
-          }
+          // Increase score when passing an obstacle
+          updateScore(score + 10);
           
-          updateStatus(`Moved to lane ${currentLane + 1}`);
+          // Increase game speed gradually
+          gameSpeed += 0.05;
         }
       }
       
-      // Store current position for next frame
-      userData.previousPosition.copy(currentPosition);
+      // Spawn new obstacles
+      const currentTime = clock.getElapsedTime();
+      if (currentTime - lastSpawnTime > spawnInterval) {
+        spawnObstacle();
+        lastSpawnTime = currentTime;
+        
+        // Decrease spawn interval gradually (make game harder)
+        spawnInterval = Math.max(0.8, spawnInterval - 0.05);
+      }
     }
 
     function render(timestamp, frame) {
+      if (!isPlaying) return renderer.render(scene, camera);
+      
       const deltaTime = clock.getDelta();
       
-      if (isGameActive) {
-        // Check controller movement for lane changes
-        checkControllerMovement();
+      if (frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
         
-        // Update player position (smooth lane transition)
-        const targetX = lanes[currentLane];
-        player.position.x += (targetX - player.position.x) * 0.1;
+        // Handle controller rotation for lane changes
+        handleControllerRotation();
         
-        // Update game elements
-        updateGameElements(deltaTime);
-      }
-
-      // Start spawning obstacles and collectibles when game starts
-      if (isGameActive && obstacles.length === 0 && collectibles.length === 0) {
-        spawnObstacle();
-        spawnCollectible();
+        // Update obstacles
+        updateObstacles(deltaTime);
+        
+        // Check for collisions
+        checkCollisions();
       }
       
       renderer.render(scene, camera);
